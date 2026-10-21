@@ -1,4 +1,6 @@
 package com.shuimumu.fuluogame.service.Impl;
+
+import com.shuimumu.fuluogame.utils.UserStatsRedisHelper;
 import cn.hutool.core.util.RandomUtil;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -24,15 +26,20 @@ import org.springframework.stereotype.Service;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+
 @Slf4j
 @Service
 public class LoginServiceImpl extends ServiceImpl<UserMapper, User> implements LoginService {
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
+
+    @Autowired
+    private UserStatsRedisHelper userStatsRedisHelper;
     @Autowired
     private RabbitTemplate rabbitTemplate;
     @Autowired
     private UserService userService;
+
     @Override
     public String login(LoginDTO loginDTO) {
         String code = stringRedisTemplate.opsForValue().get(SystemRedisKeys.loginCode(loginDTO.getPhone()));
@@ -50,7 +57,7 @@ public class LoginServiceImpl extends ServiceImpl<UserMapper, User> implements L
         stringRedisTemplate.opsForValue().set(SystemRedisKeys.loginToken(token), userVOJson,
                 SystemRedisKeys.LOGIN_USER_TTL, TimeUnit.DAYS);
         markActiveAndBackfillIfNeeded(user.getId());
-        log.info("登录成功，token：{}", token);
+        log.info("登录成功 userId={}", user.getId());
         return token;
     }
 
@@ -60,21 +67,22 @@ public class LoginServiceImpl extends ServiceImpl<UserMapper, User> implements L
         user.setUsername(SystemConstants.USER_NICK_NAME_PREFIX + RandomUtil.randomNumbers(6));
         user.setAvatar(SystemConstants.DEFAULT_AVATAR);
         save(user);
-        // 初始化 Redis 统计
-        String key = UserRedisKeys.stats(user.getId());
-        stringRedisTemplate.opsForHash().put(key, "posts", "0");
-        stringRedisTemplate.opsForHash().put(key, "following", "0");
-        stringRedisTemplate.opsForHash().put(key, "followers", "0");
-        stringRedisTemplate.opsForHash().put(key, "likes", "0");
+        userStatsRedisHelper.initZeroStats(user.getId());
         return user;
     }
 
     @Override
     public void sendCode(String phone) {
-        // 60秒内不允许重复发送
+        // 60 秒内不允许重复发送
         String intervalKey = SystemRedisKeys.loginCodeInterval(phone);
         if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(intervalKey))) {
             throw new BusinessException("验证码已发送，请60秒后重试");
+        }
+        // 单手机号每日发送上限，防短信轰炸
+        String dailyKey = SystemRedisKeys.loginCodeDailyCount(phone);
+        String daily = stringRedisTemplate.opsForValue().get(dailyKey);
+        if (daily != null && Long.parseLong(daily) >= SystemRedisKeys.LOGIN_CODE_DAILY_MAX) {
+            throw new BusinessException("今日验证码发送次数已达上限");
         }
 
         String code = RandomUtil.randomNumbers(6);
@@ -82,7 +90,12 @@ public class LoginServiceImpl extends ServiceImpl<UserMapper, User> implements L
                 SystemRedisKeys.LOGIN_CODE_TTL, TimeUnit.MINUTES);
         stringRedisTemplate.opsForValue().set(intervalKey, "1",
                 SystemRedisKeys.LOGIN_CODE_INTERVAL_TTL, TimeUnit.SECONDS);
-        log.info("验证码发送成功，验证码：{}", code);
+        Long cnt = stringRedisTemplate.opsForValue().increment(dailyKey);
+        if (cnt != null && cnt == 1L) {
+            stringRedisTemplate.expire(dailyKey, 1, TimeUnit.DAYS);
+        }
+        // 生产环境应改为真实短信/邮件发送，日志只留脱敏信息
+        log.info("验证码发送成功 phone={}", phone);
     }
 
     @Override
@@ -105,7 +118,7 @@ public class LoginServiceImpl extends ServiceImpl<UserMapper, User> implements L
     }
 
     /**
-     * 登录时打活跃标记，若用户此前不活跃（或首次），发 backfill MQ 补拉关注者的近期帖。
+     * 登录时打活跃标记，若用户此前不活跃（或首次），发 backfill MQ 补齐关注者的近期帖子。
      */
     private void markActiveAndBackfillIfNeeded(Long userId) {
         long now = System.currentTimeMillis() / 1000;
@@ -129,4 +142,5 @@ public class LoginServiceImpl extends ServiceImpl<UserMapper, User> implements L
         updateById(user);
         log.info("密码设置成功 userId={}", userId);
     }
+
 }

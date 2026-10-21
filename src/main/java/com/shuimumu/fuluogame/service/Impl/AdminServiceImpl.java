@@ -6,6 +6,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.shuimumu.fuluogame.config.RabbitMQConfig;
 import com.shuimumu.fuluogame.constants.PostRedisKeys;
 import com.shuimumu.fuluogame.constants.SystemRedisKeys;
+import com.shuimumu.fuluogame.dto.NotificationEvent;
 import com.shuimumu.fuluogame.entity.Announcement;
 import com.shuimumu.fuluogame.entity.Banner;
 import com.shuimumu.fuluogame.entity.Comment;
@@ -176,6 +177,8 @@ public class AdminServiceImpl implements AdminService {
         post.setStatus(3);
         post.setModerationDesc(reason);
         postMapper.updateById(post);
+        sendSystemNotification("admin-post-reject:" + postId + ":" + reasonHash(reason),
+                post.getUserId(), postId, postId, "你的帖子未通过审核：" + reason);
         // 清除公开缓存 + 公开 ZSET（用户自己列表保留）
         stringRedisTemplate.delete(SystemRedisKeys.cachePostContent(postId));
         stringRedisTemplate.opsForZSet().remove(PostRedisKeys.latestZset(), postId.toString());
@@ -195,6 +198,8 @@ public class AdminServiceImpl implements AdminService {
                 RabbitMQConfig.EXCHANGE,
                 RabbitMQConfig.KEY_CACHE,
                 Map.of("type", "comment", "commentId", commentId));
+        sendNotification(NotificationEvent.interaction("comment:" + commentId,
+                NotificationEvent.COMMENT, comment.getUserId(), commentId, comment.getPostId()));
     }
 
     @Override
@@ -204,6 +209,8 @@ public class AdminServiceImpl implements AdminService {
         comment.setStatus(3);
         comment.setModerationDesc(reason);
         commentMapper.updateById(comment);
+        sendSystemNotification("admin-comment-reject:" + commentId + ":" + reasonHash(reason),
+                comment.getUserId(), commentId, comment.getPostId(), "你的评论未通过审核：" + reason);
         // 清除评论缓存 + ZSET
         stringRedisTemplate.delete(SystemRedisKeys.cacheCommentContent(commentId));
         if (comment.getRootId() == null || comment.getRootId() == 0) {
@@ -214,4 +221,21 @@ public class AdminServiceImpl implements AdminService {
         stringRedisTemplate.opsForZSet().remove(PostRedisKeys.userCommentZset(comment.getUserId()), commentId.toString());
     }
 
+    /** 通知发送失败不影响审核主流程（审核结果以 DB 为准，通知可重放） */
+    private void sendNotification(NotificationEvent event) {
+        try {
+            rabbitTemplate.convertAndSend(RabbitMQConfig.NOTIFICATION_EXCHANGE,
+                    RabbitMQConfig.NOTIFICATION_KEY, event);
+        } catch (Exception e) {
+            log.error("审核通知发送失败 eventId={}", event.getEventId(), e);
+        }
+    }
+
+    private void sendSystemNotification(String eventId, Long recipientId, Long targetId, Long postId, String message) {
+        sendNotification(NotificationEvent.system(eventId, recipientId, targetId, postId, message));
+    }
+
+    private String reasonHash(String reason) {
+        return Integer.toHexString(reason == null ? 0 : reason.hashCode());
+    }
 }

@@ -3,6 +3,7 @@ package com.shuimumu.fuluogame.service.Impl;
 
 import cn.hutool.json.JSONUtil;
 
+import com.shuimumu.fuluogame.service.UserService;
 import com.shuimumu.fuluogame.config.RabbitMQConfig;
 import com.shuimumu.fuluogame.constants.PostRedisKeys;
 import com.shuimumu.fuluogame.constants.SystemRedisKeys;
@@ -16,8 +17,10 @@ import com.shuimumu.fuluogame.entity.Post;
 import com.shuimumu.fuluogame.mapper.CommentMapper;
 import com.shuimumu.fuluogame.mapper.PostMapper;
 import com.shuimumu.fuluogame.service.PostCommentService;
-import com.shuimumu.fuluogame.service.UserService;
 import com.shuimumu.fuluogame.utils.CacheClient;
+import com.shuimumu.fuluogame.utils.RedisUtils;
+import com.shuimumu.fuluogame.utils.UserStatsRedisHelper;
+import com.shuimumu.fuluogame.utils.RedisHashCounter;
 
 import com.shuimumu.fuluogame.vo.CommentVO;
 import com.shuimumu.fuluogame.vo.PageVO;
@@ -29,9 +32,11 @@ import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -50,16 +55,22 @@ public class PostCommentServiceImpl implements PostCommentService {
         COMMENT_UNLIKE_SCRIPT.setResultType(Long.class);
     }
 
-    /**
-     * 确保 comment:counts:{commentId} 的 likes 字段存在，缺失则从 DB 加载。
+        /**
+     * 确保 comment:counts:{commentId} 的 likes 字段存在。
+     * 使用 HSETNX 写入，避免并发点赞 HINCRBY 后被陈旧 DB 底数覆盖。
+     * 仅播种时设置 TTL；字段已存在不续期，点赞变更时再刷新。
      */
     private void ensureCommentCounts(Long commentId) {
         String key = PostRedisKeys.commentCounts(commentId);
         if (Boolean.TRUE.equals(stringRedisTemplate.opsForHash().hasKey(key, "likes"))) return;
         Comment c = commentMapper.selectById(commentId);
         if (c == null) return;
-        stringRedisTemplate.opsForHash().put(key, "likes",
-                String.valueOf(c.getLikes() != null ? c.getLikes() : 0));
+        RedisHashCounter.initCommentCounts(
+                stringRedisTemplate,
+                key,
+                c.getLikes() != null ? c.getLikes() : 0);
+        RedisHashCounter.refreshTtl(stringRedisTemplate, key,
+                PostRedisKeys.COMMENT_COUNTS_TTL, TimeUnit.DAYS);
     }
 
     @Autowired
@@ -78,20 +89,19 @@ public class PostCommentServiceImpl implements PostCommentService {
     private CacheClient cacheClient;
 
     @Autowired
+    private UserStatsRedisHelper userStatsRedisHelper;
+
+    @Autowired
     private StringRedisTemplate stringRedisTemplate;
 
     @Autowired
     private RedisIdWorker redisIdWorker;
-    //评论缓存设计
-    //  ZADD post:comments:{postId}  commentId  createTime   ← 根评论
-    //  ZADD comment:reply:root:{rootId}  replyId  createTime ← 回复
-    //  SET cache:comment:{id}  CommentVO_JSON  7天TTL
+
     @Override
     public void create(Long userId, Long postId, String content, Long parentId) {
         long pid = parentId != null && parentId > 0 ? parentId : 0L;
         long rootId = 0L;
         if (pid != 0) {
-            // 先查缓存，miss 查库回写
             String json = stringRedisTemplate.opsForValue().get(SystemRedisKeys.cacheCommentContent(pid));
             Comment parent = null;
             if (json != null && !json.isEmpty()) {
@@ -115,29 +125,11 @@ public class PostCommentServiceImpl implements PostCommentService {
         String zsetKey = PostRedisKeys.commentZset(postId);
         long start = (long) (page - 1) * size;
         long end = start + size - 1;
-        //取评论id转为key
         Set<String> members = stringRedisTemplate.opsForZSet().range(zsetKey, start, end);
         if (members == null || members.isEmpty()) {
             return PageVO.of(List.of(), 0L, 1, 0);
         }
         List<Long> ids = members.stream().map(Long::parseLong).collect(Collectors.toList());
-        List<String> cacheKeys = ids.stream()
-                .map(SystemRedisKeys::cacheCommentContent).collect(Collectors.toList());
-        // 从 Redis 取缓存
-        List<String> cachedJsons = stringRedisTemplate.opsForValue().multiGet(cacheKeys);
-        Map<Long, CommentVO> resultMap = new LinkedHashMap<>();
-        List<Long> missIds = new ArrayList<>();
-        // 1. 缓存命中/未命中分流
-        for (int i = 0; i < ids.size(); i++) {
-            String json = cachedJsons != null ? cachedJsons.get(i) : null;
-            if (json != null && !json.isEmpty()) {
-                resultMap.put(ids.get(i), JSONUtil.toBean(json, CommentVO.class));
-                stringRedisTemplate.expire(SystemRedisKeys.cacheCommentContent(ids.get(i)),
-                        PostRedisKeys.COMMENT_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-            } else {
-                missIds.add(ids.get(i));
-            }
-        }
         String postJson = stringRedisTemplate.opsForValue().get(SystemRedisKeys.cachePostContent(postId));
         Long postAuthorId = null;
         if (postJson != null && !postJson.isEmpty()) {
@@ -146,17 +138,8 @@ public class PostCommentServiceImpl implements PostCommentService {
             Post post = postMapper.selectById(postId);
             postAuthorId = post != null ? post.getUserId() : null;
         }
-        final Long authorId = postAuthorId;
-        for (Long cid : missIds) {
-            String dataKey = SystemRedisKeys.cacheCommentContent(cid);
-            CommentVO vo = cacheClient.queryWithMutex("lock:" + dataKey, dataKey, CommentVO.class, () -> {
-                Comment c = commentMapper.selectById(cid);
-                if (c == null || c.getStatus() != 0) return null;
-                return commentToVO(c, authorId);
-            }, PostRedisKeys.COMMENT_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-            if (vo != null) resultMap.put(cid, vo);
-        }
-        // 4. pipeline 批量填回复数（避免 N+1 Redis zCard）
+        // P2 修复：抽取公共组装（MGET+回填）
+        Map<Long, CommentVO> resultMap = loadCommentVOs(ids, postAuthorId);
         List<Object> replyCounts = stringRedisTemplate.executePipelined(
                 (org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
                     for (Long cid : ids) {
@@ -174,7 +157,6 @@ public class PostCommentServiceImpl implements PostCommentService {
             }
         }
 
-        // 5. 批量填充 username/avatar（缓存优先）
         Set<Long> userIds = resultMap.values().stream()
                 .map(CommentVO::getUserId).filter(Objects::nonNull).collect(Collectors.toSet());
         Map<Long, UserVO> userMap = userService.batchGetProfiles(userIds);
@@ -186,12 +168,10 @@ public class PostCommentServiceImpl implements PostCommentService {
             }
             vo.setAuthor(postAuthorId != null && postAuthorId.equals(vo.getUserId()));
         }
-        // 6. 填充帖子标题
         String postTitle = getPostTitleFromCache(postId);
         for (CommentVO vo : resultMap.values()) {
             vo.setPostTitle(postTitle);
         }
-        // 7. 按 ZSET 顺序组装返回列表
         List<CommentVO> records = new ArrayList<>();
         for (Long cid : ids) {
             CommentVO vo = resultMap.get(cid);
@@ -214,37 +194,11 @@ public class PostCommentServiceImpl implements PostCommentService {
             return PageVO.of(List.of(), 0L, page, size);
         }
         List<Long> ids = members.stream().map(Long::parseLong).collect(Collectors.toList());
-        List<String> cacheKeys = ids.stream()
-                .map(SystemRedisKeys::cacheCommentContent).collect(Collectors.toList());
-        List<String> cachedJsons = stringRedisTemplate.opsForValue().multiGet(cacheKeys);
-        // 从 Redis 取缓存
-        Map<Long, CommentVO> resultMap = new LinkedHashMap<>();
-        List<Long> missIds = new ArrayList<>();
-        // 1. 缓存命中/未命中分流
-        for (int i = 0; i < ids.size(); i++) {
-            String json = cachedJsons != null ? cachedJsons.get(i) : null;
-            if (json != null && !json.isEmpty()) {
-                resultMap.put(ids.get(i), JSONUtil.toBean(json, CommentVO.class));
-                stringRedisTemplate.expire(SystemRedisKeys.cacheCommentContent(ids.get(i)),
-                        PostRedisKeys.COMMENT_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-            } else {
-                missIds.add(ids.get(i));
-            }
-        }
-        // 2. 查 DB 回填 miss，写回缓存
-        for (Long cid : missIds) {
-            String dataKey = SystemRedisKeys.cacheCommentContent(cid);
-            CommentVO vo = cacheClient.queryWithMutex("lock:" + dataKey, dataKey, CommentVO.class, () -> {
-                Comment c = commentMapper.selectById(cid);
-                if (c == null || c.getStatus() != 0) return null;
-                return commentToVO(c, null);
-            }, PostRedisKeys.COMMENT_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-            if (vo != null) resultMap.put(cid, vo);
-        }
+        // P2 修复：抽取公共组装（MGET+回填），回复列表不标记作者身份
+        Map<Long, CommentVO> resultMap = loadCommentVOs(ids, null);
         Set<Long> userIds = resultMap.values().stream()
                 .map(CommentVO::getUserId).filter(Objects::nonNull).collect(Collectors.toSet());
         Map<Long, UserVO> userMap = userService.batchGetProfiles(userIds);
-        // 3. 填充 username/avatar
         for (CommentVO vo : resultMap.values()) {
             UserVO u = userMap.get(vo.getUserId());
             if (u != null) {
@@ -252,11 +206,9 @@ public class PostCommentServiceImpl implements PostCommentService {
                 vo.setAvatar(u.getAvatar());
             }
         }
-        // 4. 填充帖子标题
         for (CommentVO vo : resultMap.values()) {
             vo.setPostTitle(getPostTitleFromCache(vo.getPostId()));
         }
-        // 5. 按 ZSET 顺序组装返回列表
         List<CommentVO> records = new ArrayList<>();
         for (Long cid : ids) {
             CommentVO vo = resultMap.get(cid);
@@ -281,21 +233,6 @@ public class PostCommentServiceImpl implements PostCommentService {
             return PageVO.of(List.of(), 0L, page, size);
         }
         List<Long> ids = members.stream().map(Long::parseLong).collect(Collectors.toList());
-        List<String> cacheKeys = ids.stream()
-                .map(SystemRedisKeys::cacheCommentContent).collect(Collectors.toList());
-        List<String> cachedJsons = stringRedisTemplate.opsForValue().multiGet(cacheKeys);
-        Map<Long, CommentVO> resultMap = new LinkedHashMap<>();
-        List<Long> missIds = new ArrayList<>();
-        for (int i = 0; i < ids.size(); i++) {
-            String json = cachedJsons != null ? cachedJsons.get(i) : null;
-            if (json != null && !json.isEmpty()) {
-                resultMap.put(ids.get(i), JSONUtil.toBean(json, CommentVO.class));
-                stringRedisTemplate.expire(SystemRedisKeys.cacheCommentContent(ids.get(i)),
-                        PostRedisKeys.COMMENT_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-            } else {
-                missIds.add(ids.get(i));
-            }
-        }
         String postJson = stringRedisTemplate.opsForValue().get(SystemRedisKeys.cachePostContent(postId));
         Long postAuthorId = null;
         if (postJson != null && !postJson.isEmpty()) {
@@ -304,17 +241,8 @@ public class PostCommentServiceImpl implements PostCommentService {
             Post post = postMapper.selectById(postId);
             postAuthorId = post != null ? post.getUserId() : null;
         }
-        final Long authorId = postAuthorId;
-        for (Long cid : missIds) {
-            String dataKey = SystemRedisKeys.cacheCommentContent(cid);
-            CommentVO vo = cacheClient.queryWithMutex("lock:" + dataKey, dataKey, CommentVO.class, () -> {
-                Comment c = commentMapper.selectById(cid);
-                if (c == null || c.getStatus() != 0) return null;
-                return commentToVO(c, authorId);
-            }, PostRedisKeys.COMMENT_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-            if (vo != null) resultMap.put(cid, vo);
-        }
-        // 批量填回复数
+        // P2 修复：抽取公共组装（MGET+回填）
+        Map<Long, CommentVO> resultMap = loadCommentVOs(ids, postAuthorId);
         List<Object> replyCounts = stringRedisTemplate.executePipelined(
                 (org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
                     for (Long cid : ids) {
@@ -331,7 +259,6 @@ public class PostCommentServiceImpl implements PostCommentService {
                 vo.setReplyCount((Long) replyCounts.get(idx++));
             }
         }
-        // 批量填用户信息
         Set<Long> userIds = resultMap.values().stream()
                 .map(CommentVO::getUserId).filter(Objects::nonNull).collect(Collectors.toSet());
         Map<Long, UserVO> userMap = userService.batchGetProfiles(userIds);
@@ -364,8 +291,11 @@ public class PostCommentServiceImpl implements PostCommentService {
         if (info == null) return false;
         Long authorId = info[0], postId = info[1];
         Long statsAuthorId = authorId != null ? authorId : 0L;
-        // 确保计数 key 存在再跑 Lua，避免 HINCRBY 从 0 开始
         ensureCommentCounts(commentId);
+        // Lua 会 HINCRBY 作者 likes，先 ensure user:stats
+        if (authorId != null) {
+            userStatsRedisHelper.ensureUserStats(authorId);
+        }
         List<String> keys = List.of(
                 PostRedisKeys.commentLikes(commentId),
                 UserRedisKeys.stats(statsAuthorId),
@@ -380,9 +310,12 @@ public class PostCommentServiceImpl implements PostCommentService {
         if (authorId != null) {
             stringRedisTemplate.expire(UserRedisKeys.stats(authorId),
                     UserRedisKeys.USER_STATS_TTL, TimeUnit.DAYS);
-            stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(), authorId.toString());
+            stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(authorId), authorId.toString());
         }
-        return true;
+                // 评论点赞变更：刷新 comment:counts TTL
+        RedisHashCounter.refreshTtl(stringRedisTemplate, PostRedisKeys.commentCounts(commentId),
+                PostRedisKeys.COMMENT_COUNTS_TTL, TimeUnit.DAYS);
+return true;
     }
 
     @Override
@@ -391,8 +324,11 @@ public class PostCommentServiceImpl implements PostCommentService {
         if (info == null) return false;
         Long authorId = info[0], postId = info[1];
         Long statsAuthorId = authorId != null ? authorId : 0L;
-        // 确保计数 key 存在再跑 Lua，避免 HINCRBY 从 0 开始产生负值
         ensureCommentCounts(commentId);
+        // Lua 会 HINCRBY 作者 likes，先 ensure user:stats
+        if (authorId != null) {
+            userStatsRedisHelper.ensureUserStats(authorId);
+        }
         List<String> keys = List.of(
                 PostRedisKeys.commentLikes(commentId),
                 UserRedisKeys.stats(statsAuthorId),
@@ -407,9 +343,12 @@ public class PostCommentServiceImpl implements PostCommentService {
         if (authorId != null) {
             stringRedisTemplate.expire(UserRedisKeys.stats(authorId),
                     UserRedisKeys.USER_STATS_TTL, TimeUnit.DAYS);
-            stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(), authorId.toString());
+            stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(authorId), authorId.toString());
         }
-        return true;
+                // 评论取消点赞：刷新 comment:counts TTL
+        RedisHashCounter.refreshTtl(stringRedisTemplate, PostRedisKeys.commentCounts(commentId),
+                PostRedisKeys.COMMENT_COUNTS_TTL, TimeUnit.DAYS);
+return true;
     }
 
     private Long[] getCommentInfo(Long commentId) {
@@ -426,24 +365,61 @@ public class PostCommentServiceImpl implements PostCommentService {
         return null;
     }
 
+    /**
+     * P1 优化：批量填充评论点赞数。
+     * 原实现每条评论一次 HGET(comment:counts:{id} likes)，读一页（20 条）即 20 次 Redis 往返；
+     * 这里用 executePipelined 把整页 HGET 合并为一次往返（与帖子侧 PostAssembler.fillCounts 对齐）。
+     */
     private void fillCommentLikesCount(List<CommentVO> records) {
-        for (CommentVO vo : records) {
-            Object likes = stringRedisTemplate.opsForHash()
-                    .get(PostRedisKeys.commentCounts(vo.getId()), "likes");
+        if (records == null || records.isEmpty()) return;
+        List<Object> results = stringRedisTemplate.executePipelined(
+                (RedisCallback<Object>) connection -> {
+                    for (CommentVO vo : records) {
+                        byte[] key = PostRedisKeys.commentCounts(vo.getId()).getBytes(StandardCharsets.UTF_8);
+                        connection.hashCommands().hGet(key, "likes".getBytes(StandardCharsets.UTF_8));
+                    }
+                    return null;
+                });
+        for (int i = 0; i < records.size() && i < results.size(); i++) {
+            CommentVO vo = records.get(i);
+            Object likes = results.get(i);
             if (likes != null) {
-                vo.setLikes(Integer.parseInt(likes.toString()));
+                vo.setLikes((int) RedisUtils.toLong(bytesToStr(likes)));
             }
         }
     }
 
+    /**
+     * P1 优化：批量填充当前用户评论点赞状态。
+     * 原实现每条评论一次 SISMEMBER(comment:likes:{id})，20 条即 20 次往返；
+     * 这里用 executePipelined 合并为一次往返（与帖子侧 PostAssembler.fillStatus 对齐）。
+     */
     private void fillCommentLikedStatus(List<CommentVO> records) {
+        if (records == null || records.isEmpty()) return;
         Long currentUserId;
         try { currentUserId = UserContext.getUser().getId(); } catch (Exception ignored) { return; }
+        if (currentUserId == null) return;
         String uidStr = currentUserId.toString();
-        for (CommentVO vo : records) {
-            vo.setLiked(Boolean.TRUE.equals(
-                    stringRedisTemplate.opsForSet().isMember(PostRedisKeys.commentLikes(vo.getId()), uidStr)));
+        List<Object> results = stringRedisTemplate.executePipelined(
+                (RedisCallback<Object>) connection -> {
+                    for (CommentVO vo : records) {
+                        connection.setCommands().sIsMember(
+                                PostRedisKeys.commentLikes(vo.getId()).getBytes(StandardCharsets.UTF_8),
+                                uidStr.getBytes(StandardCharsets.UTF_8));
+                    }
+                    return null;
+                });
+        for (int i = 0; i < records.size() && i < results.size(); i++) {
+            CommentVO vo = records.get(i);
+            vo.setLiked(Boolean.TRUE.equals(results.get(i)));
         }
+    }
+
+    /** pipeline 返回的 byte[] 兜底转 String，与帖子侧 PostAssembler 保持一致。 */
+    private static String bytesToStr(Object o) {
+        if (o == null) return null;
+        if (o instanceof byte[] b) return new String(b, StandardCharsets.UTF_8);
+        return o.toString();
     }
 
     private CommentVO commentToVO(Comment c, Long postAuthorId) {
@@ -451,6 +427,37 @@ public class PostCommentServiceImpl implements PostCommentService {
         BeanUtils.copyProperties(c, vo);
         vo.setAuthor(postAuthorId != null && postAuthorId.equals(c.getUserId()));
         return vo;
+    }
+
+    /**
+     * P2 修复（样板复制抽取）：按 id 保序加载评论内容缓存 + 互斥锁回填。
+     * list/replies/list-hot 三处复制的「MGET + 命中/未命中 + 回填」统一到这里；
+     * 命中后不再逐条续期（固定 TTL），回填只保留 status=0 的可见评论。
+     */
+    private Map<Long, CommentVO> loadCommentVOs(List<Long> ids, Long postAuthorId) {
+        Map<Long, CommentVO> resultMap = new LinkedHashMap<>();
+        List<String> cacheKeys = ids.stream()
+                .map(SystemRedisKeys::cacheCommentContent).collect(Collectors.toList());
+        List<String> cachedJsons = stringRedisTemplate.opsForValue().multiGet(cacheKeys);
+        List<Long> missIds = new ArrayList<>();
+        for (int i = 0; i < ids.size(); i++) {
+            String json = cachedJsons != null ? cachedJsons.get(i) : null;
+            if (json != null && !json.isEmpty()) {
+                resultMap.put(ids.get(i), JSONUtil.toBean(json, CommentVO.class));
+            } else {
+                missIds.add(ids.get(i));
+            }
+        }
+        for (Long cid : missIds) {
+            String dataKey = SystemRedisKeys.cacheCommentContent(cid);
+            CommentVO vo = cacheClient.queryWithMutex("lock:" + dataKey, dataKey, CommentVO.class, () -> {
+                Comment c = commentMapper.selectById(cid);
+                if (c == null || c.getStatus() != 0) return null;
+                return commentToVO(c, postAuthorId);
+            }, PostRedisKeys.COMMENT_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
+            if (vo != null) resultMap.put(cid, vo);
+        }
+        return resultMap;
     }
 
     private String getPostTitleFromCache(Long postId) {

@@ -2,6 +2,15 @@
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.shuimumu.fuluogame.mapper.PostMapper">
 
+    <insert id="insertBatch">
+        INSERT INTO `post`
+            (id, user_id, title, content, images, likes, comments, views, shares, topic_names, status, create_time, update_time)
+        VALUES
+        <foreach collection="list" item="p" separator=",">
+            (#{p.id}, #{p.userId}, #{p.title}, #{p.content}, #{p.images}, #{p.likes}, #{p.comments}, #{p.views}, #{p.shares}, #{p.topicNames}, #{p.status}, #{p.createTime}, #{p.updateTime})
+        </foreach>
+        ON DUPLICATE KEY UPDATE id = id
+    </insert>
     <update id="upsertBatch">
         UPDATE `post` SET
             likes = CASE id
@@ -24,5 +33,57 @@
             #{item.id}
         </foreach>
     </update>
+
+    <update id="updateStatusBatch">
+        UPDATE `post` SET
+            status = CASE id
+                <foreach collection="list" item="p">
+                    WHEN #{p.id} THEN #{p.status}
+                </foreach>
+            END,
+            moderation_desc = CASE id
+                <foreach collection="list" item="p">
+                    WHEN #{p.id} THEN #{p.moderationDesc}
+                </foreach>
+            END,
+            moderation_words = CASE id
+                <foreach collection="list" item="p">
+                    WHEN #{p.id} THEN #{p.moderationWords}
+                </foreach>
+            END
+        WHERE id IN
+        <foreach collection="list" item="p" open="(" separator="," close=")">
+            #{p.id}
+        </foreach>
+    </update>
+
+<select id="countPublished" resultType="long">
+        SELECT COUNT(*) FROM `post` WHERE status = 0
+    </select>
+
+    <select id="selectLatestIds" resultType="long">
+        SELECT id FROM `post`
+        WHERE status = 0
+        ORDER BY create_time DESC, id DESC
+        LIMIT #{limit} OFFSET #{offset}
+    </select>
+
+    <select id="countPublishedByTopic" resultType="long">
+        SELECT COUNT(*)
+        FROM `post` p
+        INNER JOIN `post_topic` pt ON p.id = pt.post_id
+        WHERE pt.topic_id = #{topicId}
+          AND p.status = 0
+    </select>
+
+    <select id="selectLatestIdsByTopic" resultType="long">
+        SELECT p.id
+        FROM `post` p
+        INNER JOIN `post_topic` pt ON p.id = pt.post_id
+        WHERE pt.topic_id = #{topicId}
+          AND p.status = 0
+        ORDER BY p.create_time DESC, p.id DESC
+        LIMIT #{limit} OFFSET #{offset}
+    </select>
 
 </mapper>

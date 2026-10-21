@@ -10,11 +10,19 @@ import org.springframework.amqp.support.converter.MessageConverter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import java.util.Map;
+
 @Configuration
 public class
 RabbitMQConfig {
 
     public static final String EXCHANGE = "fuluo.sync";
+
+    // ===== 通知：独立 exchange，与业务同步队列隔离（通知可独立扩容/降级，互不阻塞） =====
+    public static final String NOTIFICATION_EXCHANGE = "fuluo.notification";
+    public static final String NOTIFICATION_QUEUE = "notification.events";
+    public static final String NOTIFICATION_KEY = "notification.event";
+
     public static final String QUEUE_FOLLOW = "sync.follow";
     public static final String QUEUE_LIKE = "sync.like";
     public static final String KEY_FOLLOW = "follow";
@@ -51,8 +59,25 @@ RabbitMQConfig {
     public static final String QUEUE_BACKFILL = "sync.backfill";
     public static final String KEY_BACKFILL = "backfill";
 
+    // ===== 死信交换机/队列，毒消息治理 =====
+    // 配合 application.yaml 的 spring.rabbitmq.listener.simple.default-requeue-rejected=false：
+    // 消费端重试 3 次仍失败的消息不再无限重投（此前 true 会让毒消息无限循环），
+    // 而是由 broker 死信路由到 fuluo.dlx -> fuluo.dlx.queue。运维监控该队列深度即可发现毒消息，人工排查后重放。
+    public static final String DLX_EXCHANGE = "fuluo.dlx";
+    public static final String DLX_QUEUE = "fuluo.dlx.queue";
+    public static final String DLX_KEY = "dead.letter";
+
+    /** 所有业务队列统一挂死信：x-dead-letter-exchange -> DLX，routingKey -> DLX_KEY */
+    private static final Map<String, Object> DLX_ARGS =
+            Map.of("x-dead-letter-exchange", DLX_EXCHANGE,
+                    "x-dead-letter-routing-key", DLX_KEY);
+
     @Bean
     public DirectExchange syncExchange() { return new DirectExchange(EXCHANGE); }
+
+    // 通知交换机（notification.events 队列与绑定见 NotificationRabbitConfig）
+    @Bean
+    public DirectExchange notificationExchange() { return new DirectExchange(NOTIFICATION_EXCHANGE); }
 
     // Canal 直投目标：TopicExchange，routing key 与 instance.properties 的 canal.mq.topic 一致
     @Bean
@@ -62,32 +87,42 @@ RabbitMQConfig {
     @Bean
     public Binding cdcBinding() { return BindingBuilder.bind(cdcQueue()).to(cdcExchange()).with(KEY_CDC); }
 
+    // 死信交换机 + 死信队列（只挂不消费，供人工排查）
     @Bean
-    public Queue followQueue() { return new Queue(QUEUE_FOLLOW, true); }
+    public DirectExchange deadLetterExchange() { return new DirectExchange(DLX_EXCHANGE); }
     @Bean
-    public Queue likeQueue() { return new Queue(QUEUE_LIKE, true); }
+    public Queue deadLetterQueue() { return new Queue(DLX_QUEUE, true); }
     @Bean
-    public Queue commentLikeQueue() { return new Queue(QUEUE_COMMENT_LIKE, true); }
+    public Binding deadLetterBinding() {
+        return BindingBuilder.bind(deadLetterQueue()).to(deadLetterExchange()).with(DLX_KEY);
+    }
+
     @Bean
-    public Queue commentQueue() { return new Queue(QUEUE_COMMENT, true); }
+    public Queue followQueue() { return new Queue(QUEUE_FOLLOW, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue esIndexQueue() { return new Queue(QUEUE_ES_INDEX, true); }
+    public Queue likeQueue() { return new Queue(QUEUE_LIKE, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue esUpdateQueue() { return new Queue(QUEUE_ES_UPDATE, true); }
+    public Queue commentLikeQueue() { return new Queue(QUEUE_COMMENT_LIKE, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue esDeleteQueue() { return new Queue(QUEUE_ES_DELETE, true); }
+    public Queue commentQueue() { return new Queue(QUEUE_COMMENT, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue moderationQueue() { return new Queue(QUEUE_MODERATION, true); }
+    public Queue esIndexQueue() { return new Queue(QUEUE_ES_INDEX, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue commentModerationQueue() { return new Queue(QUEUE_COMMENT_MODERATION, true); }
+    public Queue esUpdateQueue() { return new Queue(QUEUE_ES_UPDATE, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue cacheQueue() { return new Queue(QUEUE_CACHE, true); }
+    public Queue esDeleteQueue() { return new Queue(QUEUE_ES_DELETE, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue inboxQueue() { return new Queue(QUEUE_INBOX, true); }
+    public Queue moderationQueue() { return new Queue(QUEUE_MODERATION, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue postPersistenceQueue() { return new Queue(QUEUE_PERSISTENCE_POST, true); }
+    public Queue commentModerationQueue() { return new Queue(QUEUE_COMMENT_MODERATION, true, false, false, DLX_ARGS); }
     @Bean
-    public Queue commentPersistenceQueue() { return new Queue(QUEUE_PERSISTENCE_COMMENT, true); }
+    public Queue cacheQueue() { return new Queue(QUEUE_CACHE, true, false, false, DLX_ARGS); }
+    @Bean
+    public Queue inboxQueue() { return new Queue(QUEUE_INBOX, true, false, false, DLX_ARGS); }
+    @Bean
+    public Queue postPersistenceQueue() { return new Queue(QUEUE_PERSISTENCE_POST, true, false, false, DLX_ARGS); }
+    @Bean
+    public Queue commentPersistenceQueue() { return new Queue(QUEUE_PERSISTENCE_COMMENT, true, false, false, DLX_ARGS); }
 
     @Bean
     public Binding followBinding() { return BindingBuilder.bind(followQueue()).to(syncExchange()).with(KEY_FOLLOW); }
@@ -116,7 +151,7 @@ RabbitMQConfig {
     @Bean
     public Binding commentPersistenceBinding() { return BindingBuilder.bind(commentPersistenceQueue()).to(syncExchange()).with(KEY_PERSISTENCE_COMMENT); }
     @Bean
-    public Queue backfillQueue() { return new Queue(QUEUE_BACKFILL, true); }
+    public Queue backfillQueue() { return new Queue(QUEUE_BACKFILL, true, false, false, DLX_ARGS); }
     @Bean
     public Binding backfillBinding() { return BindingBuilder.bind(backfillQueue()).to(syncExchange()).with(KEY_BACKFILL); }
 
