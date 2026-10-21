@@ -19,12 +19,16 @@ import com.shuimumu.fuluogame.service.PostService;
 import com.shuimumu.fuluogame.service.UserService;
 import com.shuimumu.fuluogame.utils.CacheClient;
 import com.shuimumu.fuluogame.utils.PostAssembler;
+import com.shuimumu.fuluogame.utils.PostFeedSupport;
+import com.shuimumu.fuluogame.utils.UserStatsRedisHelper;
 import com.shuimumu.fuluogame.utils.PostBloomFilter;
+import com.shuimumu.fuluogame.utils.RedisHashCounter;
 import com.shuimumu.fuluogame.utils.RedisIdWorker;
 import com.shuimumu.fuluogame.vo.PageVO;
 import com.shuimumu.fuluogame.vo.PostContentVO;
 import com.shuimumu.fuluogame.vo.UserVO;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
@@ -50,20 +54,28 @@ public class PostServiceImpl implements PostService {
         UNLIKE_SCRIPT.setResultType(Long.class);
     }
 
-    /**
-     * 确保 post:counts:{postId} 所有字段齐全，缺失则从 DB 全量加载。
-     * 任何 HINCRBY 之前调用；Lua 操作在脚本执行前调用以避免空 key 被 Lua 从零创建。
+        /**
+     * 确保 post:counts:{postId} 的 likes/comments/views 齐全。
+     * 缺失字段从 DB 读取后通过 HSETNX 补齐，避免 putAll 覆盖并发 HINCRBY 增量。
+     * 任何 HINCRBY 之前调用，防止空 key 从 0 开始累加。
+     * <p>仅在发生播种（字段补齐）时设置 TTL；字段已齐全的快路径不续期，
+     * 让长期无互动的帖子计数自然过期。真正的计数变更由写路径 refreshTtl。
      */
     private void ensurePostCounts(Long postId) {
         String key = PostRedisKeys.counts(postId);
         Long hlen = stringRedisTemplate.opsForHash().size(key);
-        if (hlen != null && hlen >= 3) return; // likes, comments, views 都齐全
+        if (hlen != null && hlen >= 3) return; // likes/comments/views 已齐全
         Post post = postMapper.selectById(postId);
         if (post == null) return;
-        stringRedisTemplate.opsForHash().putAll(key,
-                Map.of("likes",    String.valueOf(post.getLikes() != null ? post.getLikes() : 0),
-                       "comments", String.valueOf(post.getComments() != null ? post.getComments() : 0),
-                       "views",    String.valueOf(post.getViews() != null ? post.getViews() : 0)));
+        RedisHashCounter.initPostCounts(
+                stringRedisTemplate,
+                key,
+                post.getLikes() != null ? post.getLikes() : 0,
+                post.getComments() != null ? post.getComments() : 0,
+                post.getViews() != null ? post.getViews() : 0);
+        // 从 DB 播种后设置初始 TTL
+        RedisHashCounter.refreshTtl(stringRedisTemplate, key,
+                PostRedisKeys.POST_COUNTS_TTL, java.util.concurrent.TimeUnit.DAYS);
     }
 
     @Autowired
@@ -71,6 +83,9 @@ public class PostServiceImpl implements PostService {
 
     @Autowired
     private PostAssembler postAssembler;
+
+    @Autowired
+    private PostFeedSupport postFeedSupport;
 
     @Autowired
     private UserService userService;
@@ -85,11 +100,14 @@ public class PostServiceImpl implements PostService {
     private PostBloomFilter postBloomFilter;
 
     @Autowired
-    private RabbitTemplate rabbitTemplate;
+    private UserStatsRedisHelper userStatsRedisHelper;
 
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
 
     @Autowired
     private ElasticsearchClient esClient;
+
 
     @Autowired
     private RedisIdWorker redisIdWorker;
@@ -106,58 +124,61 @@ public class PostServiceImpl implements PostService {
                 postDTO.getTopicIds() != null && !postDTO.getTopicIds().isEmpty()
                         ? postDTO.getTopicIds().stream().map(String::valueOf)
                             .collect(Collectors.joining(",")) : null);
-        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.KEY_PERSISTENCE_POST, msg);
+        // P1 修复：携带 CorrelationData，便于 RabbitReliabilityConfig 的 Confirm 回调定位失败消息
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.KEY_PERSISTENCE_POST, msg,
+                new CorrelationData("post:" + postId));
     }
 
     @Override
     public PageVO<PostContentVO> getPostList(String tab, int page, int size) {
-        String zsetKey = "hot".equals(tab) ? PostRedisKeys.hotZset() : PostRedisKeys.latestZset();
+        if (page < 1) page = 1;
+        if (size < 1) size = 10;
         long start = (long) (page - 1) * size;
         long end = start + size - 1;
-        Set<String> members = stringRedisTemplate.opsForZSet().reverseRange(zsetKey, start, end);
-        if (members == null || members.isEmpty()) {
-            return PageVO.of(List.of(), 0, page, size);
-        }
-        List<Long> postIds = members.stream().map(Long::parseLong).collect(Collectors.toList());
-        // 批量查单帖缓存
-        List<String> cacheKeys = postIds.stream()
-                .map(SystemRedisKeys::cachePostContent).collect(Collectors.toList());
-        List<String> cachedJsons = stringRedisTemplate.opsForValue().multiGet(cacheKeys);
-        Map<Long, PostContentVO> resultMap = new LinkedHashMap<>();
-        List<Long> missIds = new ArrayList<>();
-        for (int i = 0; i < postIds.size(); i++) {
-            Long pid = postIds.get(i);
-            String json = cachedJsons != null ? cachedJsons.get(i) : null;
-            if (json != null && !json.isEmpty()) {
-                resultMap.put(pid, JSONUtil.toBean(json, PostContentVO.class));
-                stringRedisTemplate.expire(SystemRedisKeys.cachePostContent(pid),
-                        PostRedisKeys.POST_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-            } else {
-                missIds.add(pid);
+
+        // 热门流：仅 Redis ZSET（不降级 DB）
+        if ("hot".equals(tab)) {
+            String zsetKey = PostRedisKeys.hotZset();
+            Set<String> members = stringRedisTemplate.opsForZSet().reverseRange(zsetKey, start, end);
+            if (members == null || members.isEmpty()) {
+                return PageVO.of(List.of(), 0, page, size);
             }
+            List<PostContentVO> records = postFeedSupport.loadAndAssemble(postFeedSupport.membersToIds(members));
+            Long total = stringRedisTemplate.opsForZSet().zCard(zsetKey);
+            return PageVO.of(records, total != null ? total : 0, page, size);
         }
-        // miss 的加锁防击穿
-        for (Long pid : missIds) {
-            String dataKey = SystemRedisKeys.cachePostContent(pid);
-            PostContentVO vo = cacheClient.queryWithMutex("lock:" + dataKey, dataKey, PostContentVO.class, () -> {
-                Post p = postMapper.selectById(pid);
-                if (p == null || p.getStatus() != 0) return null;
-                return postAssembler.toVO(p);
-            }, PostRedisKeys.POST_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-            if (vo != null) resultMap.put(pid, vo);
+
+        // 最新流：ZSET 窗口内走 Redis，窗口外/空窗口降级 MySQL
+        String latestKey = PostRedisKeys.latestZset();
+        Long zcard = stringRedisTemplate.opsForZSet().zCard(latestKey);
+        long window = zcard != null ? zcard : 0L;
+        List<Long> postIds;
+        if (window > 0 && start < window) {
+            Set<String> members = stringRedisTemplate.opsForZSet().reverseRange(latestKey, start, end);
+            postIds = postFeedSupport.membersToIds(members);
+        } else {
+            postIds = postMapper.selectLatestIds(start, size);
+            if (postIds == null) postIds = List.of();
         }
-        // 保持 ZSET 顺序输出
-        List<PostContentVO> records = new ArrayList<>();
-        for (Long pid : postIds) {
-            PostContentVO vo = resultMap.get(pid);
-            if (vo != null) records.add(vo);
+        List<PostContentVO> records = postFeedSupport.loadAndAssemble(postIds);
+        long total = getPublishedCount();
+        return PageVO.of(records, total, page, size);
+    }
+
+    /**
+     * P2 修复：全局已发布帖子总数走 Redis 短缓存，避免最新流每请求 COUNT(*)。
+     * 总数允许 60s 延迟，缓存到期后重新 COUNT 回填。
+     */
+    private long getPublishedCount() {
+        String key = PostRedisKeys.countPublished();
+        String cached = stringRedisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            try { return Long.parseLong(cached); } catch (NumberFormatException ignored) { }
         }
-        postAssembler.fillUsers(records, userService.batchGetProfiles(
-                records.stream().map(PostContentVO::getUserId).filter(Objects::nonNull).collect(Collectors.toSet())));
-        postAssembler.fillCounts(records);
-        postAssembler.fillStatus(records);
-        Long total = stringRedisTemplate.opsForZSet().zCard(zsetKey);
-        return PageVO.of(records, total != null ? total : 0, page, size);
+        long total = postMapper.countPublished();
+        stringRedisTemplate.opsForValue().set(key, String.valueOf(total),
+                PostRedisKeys.COUNT_CACHE_TTL_SECONDS, TimeUnit.SECONDS);
+        return total;
     }
 
     @Override
@@ -168,8 +189,8 @@ public class PostServiceImpl implements PostService {
         if ("".equals(json)) return null;
         PostContentVO vo = null;
         if (json != null) {
+            // P1 修复：命中后不再逐次续期（避免 N+1 与热 key 永不过期），缓存固定 TTL，到期重建。
             vo = JSONUtil.toBean(json, PostContentVO.class);
-            stringRedisTemplate.expire(cacheKey, PostRedisKeys.POST_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
         } else {
             String lockKey = "lock:" + cacheKey;
             vo = cacheClient.queryWithMutex(lockKey, cacheKey, PostContentVO.class, () -> {
@@ -188,15 +209,20 @@ public class PostServiceImpl implements PostService {
         if (vo == null) return null;
         postAssembler.fillUsers(List.of(vo),
                 userService.batchGetProfiles(Set.of(vo.getUserId())));
-        // 浏览量 — 确保计数 key 存在再累加，避免 TTL 过期后从 0 开始
         ensurePostCounts(id);
         stringRedisTemplate.opsForHash().increment(PostRedisKeys.counts(id), "views", 1);
-        stringRedisTemplate.opsForSet().add(PostRedisKeys.dirty(), id.toString());
+        // 计数变化：刷新 post:counts TTL
+        RedisHashCounter.refreshTtl(stringRedisTemplate, PostRedisKeys.counts(id),
+                PostRedisKeys.POST_COUNTS_TTL, TimeUnit.DAYS);
+        stringRedisTemplate.opsForSet().add(PostRedisKeys.dirty(id), id.toString());
         Set<String> topicIds = stringRedisTemplate.opsForSet().members(PostRedisKeys.postTopicIds(id));
         if (topicIds != null) {
             for (String tid : topicIds) {
-                stringRedisTemplate.opsForHash().increment(PostRedisKeys.topic(Long.parseLong(tid)), "views", 1);
-                stringRedisTemplate.opsForSet().add(PostRedisKeys.topicDirty(), tid);
+                Long topicId = Long.parseLong(tid);
+                stringRedisTemplate.opsForHash().increment(PostRedisKeys.topic(topicId), "views", 1);
+                RedisHashCounter.refreshTtl(stringRedisTemplate, PostRedisKeys.topic(topicId),
+                        PostRedisKeys.TOPIC_STATS_TTL, TimeUnit.DAYS);
+                stringRedisTemplate.opsForSet().add(PostRedisKeys.topicDirty(Long.parseLong(tid)), tid);
             }
         }
         postAssembler.fillCounts(List.of(vo));
@@ -209,14 +235,16 @@ public class PostServiceImpl implements PostService {
         Post post = postMapper.selectById(postId);
         if (post == null) throw new RuntimeException("帖子不存在");
         if (!post.getUserId().equals(UserContext.getUser().getId())) {
-            throw new RuntimeException("只能编辑自己的帖子");
+            throw new RuntimeException("无权编辑该帖子");
         }
         if (post.getStatus() == 1) throw new RuntimeException("帖子已删除，无法编辑");
         PostPersistMsg msg = new PostPersistMsg(postId, UserContext.getUser().getId(), false,
                 postDTO.getTitle(), postDTO.getContent(),
                 postDTO.getImages() != null ? JSONUtil.toJsonStr(postDTO.getImages()) : null,
                 null);
-        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.KEY_PERSISTENCE_POST, msg);
+        // P1 修复：携带 CorrelationData，便于 RabbitReliabilityConfig 的 Confirm 回调定位失败消息
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.KEY_PERSISTENCE_POST, msg,
+                new CorrelationData("post:" + postId));
     }
 
     @Override
@@ -224,12 +252,12 @@ public class PostServiceImpl implements PostService {
         Post post = postMapper.selectById(postId);
         if (post == null) throw new RuntimeException("帖子不存在");
         if (!post.getUserId().equals(UserContext.getUser().getId())) {
-            throw new RuntimeException("只能删除自己的帖子");
+            throw new RuntimeException("无权删除该帖子");
         }
         int oldStatus = post.getStatus();
         post.setStatus(1);
         postMapper.updateById(post);
-        // 移除 ZSET
+        // 从公开/用户 ZSET 中移除
         stringRedisTemplate.opsForZSet().remove(PostRedisKeys.latestZset(), postId.toString());
         stringRedisTemplate.opsForZSet().remove(PostRedisKeys.hotZset(), postId.toString());
         stringRedisTemplate.opsForZSet().remove(PostRedisKeys.userPostsZset(post.getUserId()), postId.toString());
@@ -240,97 +268,34 @@ public class PostServiceImpl implements PostService {
                 stringRedisTemplate.opsForZSet().remove(PostRedisKeys.topicPostsLatestZset(Long.parseLong(tid)), postId.toString());
                 stringRedisTemplate.opsForZSet().remove(PostRedisKeys.topicPostsHotZset(Long.parseLong(tid)), postId.toString());
                 if (oldStatus == 0) {
-                    stringRedisTemplate.opsForHash().increment(PostRedisKeys.topic(Long.parseLong(tid)), "posts", -1);
-                    stringRedisTemplate.opsForSet().add(PostRedisKeys.topicDirty(), tid);
+                    Long topicId = Long.parseLong(tid);
+                    stringRedisTemplate.opsForHash().increment(PostRedisKeys.topic(topicId), "posts", -1);
+                    RedisHashCounter.refreshTtl(stringRedisTemplate, PostRedisKeys.topic(topicId),
+                            PostRedisKeys.TOPIC_STATS_TTL, TimeUnit.DAYS);
+                    stringRedisTemplate.opsForSet().add(PostRedisKeys.topicDirty(Long.parseLong(tid)), tid);
                 }
             }
         }
         stringRedisTemplate.delete(PostRedisKeys.postTopicIds(postId));
         cacheClient.delete(SystemRedisKeys.cachePostContent(postId));
-        // 只有审核通过的帖子才在incrAuthorStats中+1过，删除时才对等-1
+        // 仅当原状态为公开时扣减作者发帖数
         if (oldStatus == 0) {
+            // 扣减前 ensure，避免 stats 过期后从 0 减成负数错账
+            userStatsRedisHelper.ensureUserStats(post.getUserId());
             stringRedisTemplate.opsForHash().increment(UserRedisKeys.stats(post.getUserId()), "posts", -1);
+            stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(post.getUserId()), post.getUserId().toString());
         }
         rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.KEY_ES_DELETE,
                 Map.of("postId", postId));
     }
 
-    @Override
-    public PageVO<PostContentVO> searchPosts(String q, int page, int size) {
-        try {
-            var response = esClient.search(s -> s.index("posts")
-                    .query(qr -> qr.multiMatch(mm -> mm.query(q).fields("title", "content")))
-                    .highlight(h -> h.fields("title", f -> f.preTags("<em>").postTags("</em>"))
-                            .fields("content", f -> f.preTags("<em>").postTags("</em>")))
-                    .from((page - 1) * size).size(size),
-                    Map.class);
-            List<Long> postIds = new ArrayList<>();
-            Map<Long, Map<String, String>> highlights = new HashMap<>();
-            if (response.hits().hits() != null) {
-                for (var hit : response.hits().hits()) {
-                    Long pid = Long.parseLong(hit.id());
-                    postIds.add(pid);
-                    if (hit.highlight() != null) {
-                        Map<String, String> hl = new HashMap<>();
-                        if (hit.highlight().get("title") != null && !hit.highlight().get("title").isEmpty())
-                            hl.put("title", String.join("", hit.highlight().get("title")));
-                        if (hit.highlight().get("content") != null && !hit.highlight().get("content").isEmpty())
-                            hl.put("content", String.join("", hit.highlight().get("content")));
-                        highlights.put(pid, hl);
-                    }
-                }
-            }
-            long total = response.hits().total() != null ? response.hits().total().value() : 0;
-            if (postIds.isEmpty()) return PageVO.of(List.of(), total, page, size);
-            // MGET 缓存
-            List<String> keys = postIds.stream().map(SystemRedisKeys::cachePostContent).collect(Collectors.toList());
-            List<String> jsons = stringRedisTemplate.opsForValue().multiGet(keys);
-            List<PostContentVO> records = new ArrayList<>();
-            List<Long> miss = new ArrayList<>();
-            for (int i = 0; i < postIds.size(); i++) {
-                String json = jsons != null ? jsons.get(i) : null;
-                if (json != null && !json.isEmpty()) {
-                    records.add(JSONUtil.toBean(json, PostContentVO.class));
-                } else {
-                    miss.add(postIds.get(i));
-                }
-            }
-            if (!miss.isEmpty()) {
-                List<Post> missPosts = postMapper.selectByIds(miss);
-                for (Post p : missPosts) {
-                    if (p.getStatus() == 0) {
-                        PostContentVO vo = postAssembler.toVO(p);
-                        cacheClient.set(SystemRedisKeys.cachePostContent(vo.getId()),
-                                JSONUtil.toJsonStr(vo), PostRedisKeys.POST_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
-                        records.add(vo);
-                    }
-                }
-            }
-            // 填高亮
-            for (PostContentVO vo : records) {
-                Map<String, String> hl = highlights.get(vo.getId());
-                if (hl != null) {
-                    if (hl.containsKey("title")) vo.setTitleHighlight(hl.get("title"));
-                    if (hl.containsKey("content")) vo.setContentHighlight(hl.get("content"));
-                }
-            }
-            postAssembler.fillUsers(records, userService.batchGetProfiles(
-                    records.stream().map(PostContentVO::getUserId).filter(Objects::nonNull).collect(Collectors.toSet())));
-            postAssembler.fillCounts(records);
-            postAssembler.fillStatus(records);
-            return PageVO.of(records, total, page, size);
-        } catch (Exception e) {
-            log.error("ES 搜索失败 q={}", q, e);
-            return PageVO.of(List.of(), 0, page, size);
-        }
-    }
-
-    // ========== 点赞 ==========
+    // ========== 点赞 / 取消点赞 ==========
 
     @Override
     public boolean like(Long userId, Long postId, Long authorId) {
         // 在 Lua 执行前确保计数 key 存在，避免 HINCRBY 从 0 开始
         ensurePostCounts(postId);
+        userStatsRedisHelper.ensureUserStats(authorId);
         List<String> keys = List.of(
                 PostRedisKeys.likes(postId),
                 UserRedisKeys.stats(authorId),
@@ -344,15 +309,20 @@ public class PostServiceImpl implements PostService {
                 new SyncMessage("like", userId, postId, authorId));
         stringRedisTemplate.expire(UserRedisKeys.stats(authorId),
                 UserRedisKeys.USER_STATS_TTL, TimeUnit.DAYS);
-        stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(), authorId.toString());
-        stringRedisTemplate.opsForSet().add(PostRedisKeys.dirty(), postId.toString());
+        stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(authorId), authorId.toString());
+        stringRedisTemplate.opsForSet().add(PostRedisKeys.dirty(postId), postId.toString());
+        // 点赞变更了 likes：刷新 post:counts TTL
+        RedisHashCounter.refreshTtl(stringRedisTemplate, PostRedisKeys.counts(postId),
+                PostRedisKeys.POST_COUNTS_TTL, TimeUnit.DAYS);
         return true;
     }
 
     @Override
     public boolean unlike(Long userId, Long postId, Long authorId) {
-        // 在 Lua 执行前确保计数 key 存在，避免 HINCRBY 从 0 开始产生负值
+        // 在 Lua 执行前确保计数 key 存在，避免 HINCRBY 从 0 开始
         ensurePostCounts(postId);
+        // Lua 会 HINCRBY 作者 likes，先 ensure user:stats
+        userStatsRedisHelper.ensureUserStats(authorId);
         List<String> keys = List.of(
                 PostRedisKeys.likes(postId),
                 UserRedisKeys.stats(authorId),
@@ -366,8 +336,11 @@ public class PostServiceImpl implements PostService {
                 new SyncMessage("unlike", userId, postId, authorId));
         stringRedisTemplate.expire(UserRedisKeys.stats(authorId),
                 UserRedisKeys.USER_STATS_TTL, TimeUnit.DAYS);
-        stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(), authorId.toString());
-        stringRedisTemplate.opsForSet().add(PostRedisKeys.dirty(), postId.toString());
+        stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(authorId), authorId.toString());
+        stringRedisTemplate.opsForSet().add(PostRedisKeys.dirty(postId), postId.toString());
+        // 点赞变更了 likes：刷新 post:counts TTL
+        RedisHashCounter.refreshTtl(stringRedisTemplate, PostRedisKeys.counts(postId),
+                PostRedisKeys.POST_COUNTS_TTL, TimeUnit.DAYS);
         return true;
     }
 
@@ -397,4 +370,71 @@ public class PostServiceImpl implements PostService {
 //        log.info("ZSET 重建完成，latest={}，hot={}", all.size(), all.size());
 //    }
 
+    @Override
+    public PageVO<PostContentVO> searchPosts(String q, int page, int size) {
+        try {
+            var response = esClient.search(s -> s.index("posts")
+                    .query(qr -> qr.multiMatch(mm -> mm.query(q).fields("title", "content")))
+                    .highlight(h -> h.fields("title", f -> f.preTags("<em>").postTags("</em>"))
+                            .fields("content", f -> f.preTags("<em>").postTags("</em>")))
+                    .from((page - 1) * size).size(size),
+                    Map.class);
+            List<Long> postIds = new ArrayList<>();
+            Map<Long, Map<String, String>> highlights = new HashMap<>();
+            if (response.hits().hits() != null) {
+                for (var hit : response.hits().hits()) {
+                    Long pid = Long.parseLong(hit.id());
+                    postIds.add(pid);
+                    if (hit.highlight() != null) {
+                        Map<String, String> hl = new HashMap<>();
+                        if (hit.highlight().get("title") != null && !hit.highlight().get("title").isEmpty())
+                            hl.put("title", String.join("", hit.highlight().get("title")));
+                        if (hit.highlight().get("content") != null && !hit.highlight().get("content").isEmpty())
+                            hl.put("content", String.join("", hit.highlight().get("content")));
+                        highlights.put(pid, hl);
+                    }
+                }
+            }
+            long total = response.hits().total() != null ? response.hits().total().value() : 0;
+            if (postIds.isEmpty()) return PageVO.of(List.of(), total, page, size);
+            List<String> keys = postIds.stream().map(SystemRedisKeys::cachePostContent).collect(Collectors.toList());
+            List<String> jsons = stringRedisTemplate.opsForValue().multiGet(keys);
+            List<PostContentVO> records = new ArrayList<>();
+            List<Long> miss = new ArrayList<>();
+            for (int i = 0; i < postIds.size(); i++) {
+                String json = jsons != null ? jsons.get(i) : null;
+                if (json != null && !json.isEmpty()) {
+                    records.add(JSONUtil.toBean(json, PostContentVO.class));
+                } else {
+                    miss.add(postIds.get(i));
+                }
+            }
+            if (!miss.isEmpty()) {
+                List<Post> missPosts = postMapper.selectByIds(miss);
+                for (Post p : missPosts) {
+                    if (p.getStatus() == 0) {
+                        PostContentVO vo = postAssembler.toVO(p);
+                        cacheClient.set(SystemRedisKeys.cachePostContent(vo.getId()),
+                                JSONUtil.toJsonStr(vo), PostRedisKeys.POST_CONTENT_CACHE_TTL, TimeUnit.MINUTES);
+                        records.add(vo);
+                    }
+                }
+            }
+            for (PostContentVO vo : records) {
+                Map<String, String> hl = highlights.get(vo.getId());
+                if (hl != null) {
+                    if (hl.containsKey("title")) vo.setTitleHighlight(hl.get("title"));
+                    if (hl.containsKey("content")) vo.setContentHighlight(hl.get("content"));
+                }
+            }
+            postAssembler.fillUsers(records, userService.batchGetProfiles(
+                    records.stream().map(PostContentVO::getUserId).filter(Objects::nonNull).collect(Collectors.toSet())));
+            postAssembler.fillCounts(records);
+            postAssembler.fillStatus(records);
+            return PageVO.of(records, total, page, size);
+        } catch (Exception e) {
+            log.error("ES 搜索失败 q={}", q, e);
+            return PageVO.of(List.of(), 0, page, size);
+        }
+    }
 }

@@ -12,6 +12,8 @@ import com.shuimumu.fuluogame.entity.PostTopic;
 import com.shuimumu.fuluogame.mapper.CommentMapper;
 import com.shuimumu.fuluogame.mapper.PostMapper;
 import com.shuimumu.fuluogame.mapper.PostTopicMapper;
+import com.shuimumu.fuluogame.utils.RedisHashCounter;
+import com.shuimumu.fuluogame.utils.RedisZSetTrim;
 import com.shuimumu.fuluogame.utils.CacheClient;
 import com.shuimumu.fuluogame.vo.PostContentVO;
 import lombok.extern.slf4j.Slf4j;
@@ -45,19 +47,28 @@ public class CacheSyncConsumer {
     private CacheClient cacheClient;
 
 
-    /**
-     * 确保 post:counts:{postId} 所有字段齐全，缺失则从 DB 全量加载。
+        /**
+     * 确保 post:counts:{postId} 的 likes/comments/views 齐全。
+     * 缺失字段从 DB 读取后通过 HSETNX 补齐，避免 putAll 覆盖并发 HINCRBY 增量。
+     * 任何 HINCRBY 之前调用，防止空 key 从 0 开始累加。
+     * <p>仅在发生播种（字段补齐）时设置 TTL；字段已齐全的快路径不续期，
+     * 让长期无互动的帖子计数自然过期。真正的计数变更由写路径 refreshTtl。
      */
     private void ensurePostCounts(Long postId) {
         String key = PostRedisKeys.counts(postId);
         Long hlen = stringRedisTemplate.opsForHash().size(key);
-        if (hlen != null && hlen >= 3) return;
+        if (hlen != null && hlen >= 3) return; // likes/comments/views 已齐全
         Post post = postMapper.selectById(postId);
         if (post == null) return;
-        stringRedisTemplate.opsForHash().putAll(key,
-                Map.of("likes",    String.valueOf(post.getLikes() != null ? post.getLikes() : 0),
-                       "comments", String.valueOf(post.getComments() != null ? post.getComments() : 0),
-                       "views",    String.valueOf(post.getViews() != null ? post.getViews() : 0)));
+        RedisHashCounter.initPostCounts(
+                stringRedisTemplate,
+                key,
+                post.getLikes() != null ? post.getLikes() : 0,
+                post.getComments() != null ? post.getComments() : 0,
+                post.getViews() != null ? post.getViews() : 0);
+        // 从 DB 播种后设置初始 TTL
+        RedisHashCounter.refreshTtl(stringRedisTemplate, key,
+                PostRedisKeys.POST_COUNTS_TTL, java.util.concurrent.TimeUnit.DAYS);
     }
 
     @SuppressWarnings("unchecked")
@@ -86,6 +97,9 @@ public class CacheSyncConsumer {
 
         // 1. ZADD latest
         stringRedisTemplate.opsForZSet().add(PostRedisKeys.latestZset(), postIdStr, createEpoch);
+        // 最新流只保留窗口，超出部分由列表接口降级 MySQL
+        RedisZSetTrim.trimToMax(stringRedisTemplate, PostRedisKeys.latestZset(),
+                PostRedisKeys.LATEST_ZSET_MAX);
 
         // 2. 写单帖缓存
         PostContentVO vo = new PostContentVO();
@@ -118,6 +132,8 @@ public class CacheSyncConsumer {
                 new LambdaQueryWrapper<PostTopic>().eq(PostTopic::getPostId, postId));
         for (PostTopic pt : pts) {
             stringRedisTemplate.opsForZSet().add(PostRedisKeys.topicPostsLatestZset(pt.getTopicId()), postIdStr, createEpoch);
+            RedisZSetTrim.trimToMax(stringRedisTemplate, PostRedisKeys.topicPostsLatestZset(pt.getTopicId()),
+                    PostRedisKeys.TOPIC_LATEST_ZSET_MAX);
             stringRedisTemplate.opsForSet().add(PostRedisKeys.postTopicIds(postId), pt.getTopicId().toString());
         }
 
@@ -158,6 +174,9 @@ public class CacheSyncConsumer {
         // 3. 评论计数 + 热力值 + 脏标记（先确保计数 key 完整再累加）
         ensurePostCounts(comment.getPostId());
         stringRedisTemplate.opsForHash().increment(PostRedisKeys.counts(comment.getPostId()), "comments", 1);
+            // 评论数变更：刷新 post:counts TTL
+            RedisHashCounter.refreshTtl(stringRedisTemplate, PostRedisKeys.counts(comment.getPostId()),
+                    PostRedisKeys.POST_COUNTS_TTL, java.util.concurrent.TimeUnit.DAYS);
         String postIdStr = comment.getPostId().toString();
         stringRedisTemplate.opsForZSet().incrementScore(PostRedisKeys.hotZset(), postIdStr, 0.3);
         Set<String> topicIds = stringRedisTemplate.opsForSet().members(PostRedisKeys.postTopicIds(comment.getPostId()));
@@ -167,7 +186,7 @@ public class CacheSyncConsumer {
                         PostRedisKeys.topicPostsHotZset(Long.parseLong(tid)), postIdStr, 0.3);
             }
         }
-        stringRedisTemplate.opsForSet().add(PostRedisKeys.dirty(), comment.getPostId().toString());
+        stringRedisTemplate.opsForSet().add(PostRedisKeys.dirty(comment.getPostId()), comment.getPostId().toString());
 
         log.info("评论缓存同步完成 commentId={}", commentId);
     }

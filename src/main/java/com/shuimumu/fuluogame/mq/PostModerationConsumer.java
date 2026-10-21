@@ -1,86 +1,207 @@
 package com.shuimumu.fuluogame.mq;
 
+import com.shuimumu.fuluogame.utils.UserStatsRedisHelper;
+
 import com.shuimumu.fuluogame.config.RabbitMQConfig;
 import com.shuimumu.fuluogame.constants.PostRedisKeys;
 import com.shuimumu.fuluogame.constants.UserRedisKeys;
+import com.shuimumu.fuluogame.dto.NotificationEvent;
 import com.shuimumu.fuluogame.dto.PostModerationMsg;
 import com.shuimumu.fuluogame.entity.Post;
 import com.shuimumu.fuluogame.mapper.PostMapper;
 import com.shuimumu.fuluogame.utils.ContentModerationUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
+/**
+ * 帖子审核消费者（批量）。
+ * 复用帖子落库的批量监听容器：一次接收一批消息，批量查库 + 逐条审核 + 批量回写状态，
+ * 把原来"每条 1 次 SELECT + 1 次 UPDATE"降为"每批 1 次 SELECT + 1 次 UPDATE"。
+ * 阿里云文本审核接口为单条调用，真实审核模式下仍逐条调 API（受账户 QPS 配额限制）。
+ */
 @Slf4j
 @Component
 public class PostModerationConsumer {
 
+    @Value("${fuluo.moderation.enabled:true}")
+    private boolean moderationEnabled;
+
+
     @Autowired
     private PostMapper postMapper;
 
-    @Autowired
+    // P0 修复：required=false，审核 SDK 未配置（aliyun.green.enabled!=true）时本字段为 null，
+    // 下方审核逻辑走失败安全分支（保持待审核），避免无审核放行或服务启动失败。
+    @Autowired(required = false)
     private ContentModerationUtil contentModerationUtil;
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
 
-    @RabbitListener(queues = RabbitMQConfig.QUEUE_MODERATION)
-    public void handlePost(PostModerationMsg msg) {
+    @Autowired
+    private UserStatsRedisHelper userStatsRedisHelper;
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+    @RabbitListener(queues = RabbitMQConfig.QUEUE_MODERATION,
+            containerFactory = "postModerationListenerContainerFactory")
+    public void handlePost(List<PostModerationMsg> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return;
+        }
         try {
-            Post post = postMapper.selectById(msg.getPostId());
-            if (post == null || post.getStatus() != 2) return;
-
-            ContentModerationUtil.ModerationResult result =
-                    contentModerationUtil.moderateComment(post.getTitle() + " " + post.getContent());
-
-            ContentModerationUtil.Action action = result.getAction();
-            if (action == ContentModerationUtil.Action.RETRY) {
-                throw new RuntimeException("审核接口异常，触发MQ重试");
+            // 1) 批量查库，只处理待审核（status=2）
+            List<Long> ids = messages.stream().map(PostModerationMsg::getPostId)
+                    .distinct().collect(Collectors.toList());
+            Map<Long, Post> postById = new HashMap<>();
+            List<Post> posts = postMapper.selectBatchIds(ids);
+            if (posts != null) {
+                for (Post p : posts) {
+                    postById.put(p.getId(), p);
+                }
             }
-            if (action == ContentModerationUtil.Action.PASS) {
-                post.setStatus(0); post.setModerationDesc(null); post.setModerationWords(null);
-                postMapper.updateById(post);
-                // cache/es.index/inbox-outbox 三连发已迁移至 CanalCdcConsumer，
-                // 由 status 2→0 的 binlog UPDATE 事件驱动（消除"落库成功但扇出失败"的双写不一致）。
-                // 仅保留无法从 binlog 推导的"新帖一次性"语义：作者 stats+1、话题 posts+1。
-                if (Boolean.TRUE.equals(msg.getIsNew())) {
-                    incrAuthorStats(post.getUserId());
-                    if (msg.getTopicIds() != null && !msg.getTopicIds().isEmpty()) {
-                        for (String tid : msg.getTopicIds().split(",")) {
-                            Long topicId = Long.valueOf(tid.trim());
-                            stringRedisTemplate.opsForHash().increment(PostRedisKeys.topic(topicId), "posts", 1);
-                            stringRedisTemplate.opsForSet().add(PostRedisKeys.topicDirty(), topicId.toString());
-                        }
+
+            List<Post> passPosts = new ArrayList<>();
+            List<Post> rejectPosts = new ArrayList<>();
+            List<PostModerationMsg> passMsgs = new ArrayList<>();
+            List<NotificationEvent> notifications = new ArrayList<>();
+
+            // 2) 逐条审核（跳过模式直接 PASS；真实模式循环调阿里云单条接口）
+            for (PostModerationMsg msg : messages) {
+                Post post = postById.get(msg.getPostId());
+                if (post == null || post.getStatus() != 2) continue;
+
+                ContentModerationUtil.ModerationResult result;
+                if (!moderationEnabled) {
+                    // 压测/本地调试：显式关闭审核，直接放行
+                    result = new ContentModerationUtil.ModerationResult(
+                            true, ContentModerationUtil.Action.PASS, "none", null, null, null, 0);
+                } else if (contentModerationUtil == null) {
+                    // P0 修复：审核开启但 SDK 未配置（密钥缺失）——失败安全，保持待审核，绝不无审核放行
+                    log.error("审核SDK未配置，帖子 {} 保持待审核", post.getId());
+                    result = new ContentModerationUtil.ModerationResult(
+                            false, ContentModerationUtil.Action.MANUAL_REVIEW, "none", null,
+                            "审核服务未配置", null, 0);
+                } else {
+                    result = contentModerationUtil.moderateComment(post.getTitle() + " " + post.getContent());
+                }
+
+                ContentModerationUtil.Action action = result.getAction();
+                if (result.getDescription() == null || result.getDescription().isBlank()) {
+                    result.setDescription("内容未通过审核");
+                }
+                if (action == ContentModerationUtil.Action.RETRY) {
+                    throw new RuntimeException("审核接口异常，触发MQ重试");
+                }
+                if (action == ContentModerationUtil.Action.PASS) {
+                    post.setStatus(0); post.setModerationDesc(null); post.setModerationWords(null);
+                    passPosts.add(post);
+                    passMsgs.add(msg);
+                } else {
+                    if (action == ContentModerationUtil.Action.MANUAL_REVIEW) {
+                        post.setStatus(2);
+                        log.warn("帖子待人工审核 postId={} desc={}", post.getId(), result.getDescription());
+                    } else {
+                        post.setStatus(3);
+                        log.warn("帖子审核拒绝 postId={} label={} desc={}", post.getId(),
+                                result.getLabel(), result.getDescription());
+                    }
+                    post.setModerationDesc(result.getDescription());
+                    post.setModerationWords(result.getRiskWords());
+                    if (action != ContentModerationUtil.Action.MANUAL_REVIEW) {
+                        notifications.add(NotificationEvent.system("moderation-post:" + post.getId(),
+                                post.getUserId(), post.getId(), post.getId(),
+                                "你的帖子未通过审核：" + result.getDescription()));
+                    }
+                    rejectPosts.add(post);
+                }
+            }
+
+            // 3) 批量回写审核状态（一次 UPDATE）
+            List<Post> toUpdate = new ArrayList<>(passPosts.size() + rejectPosts.size());
+            toUpdate.addAll(passPosts);
+            toUpdate.addAll(rejectPosts);
+            if (!toUpdate.isEmpty()) {
+                postMapper.updateStatusBatch(toUpdate);
+            }
+
+            // 4) 审核通过的新帖：作者统计 + 话题计数（binlog 无法推导的一次性语义）
+            //    Redis 侧为 best-effort：失败仅记日志，不回滚已落库的状态（否则整批重投后 status!=2 全部跳过，
+            //    反而放大丢失面）；状态由 status 2->0 的 binlog 事件 + dirty 标记驱动最终一致。
+            //    性能：ensureUserStats 按用户去重（每用户 1 次 HLEN），累加/续期/脏标记用 executePipelined
+            //    一次往返提交整批命令，避免逐帖多次跨主机 RTT（本机 Redis 在 WSL2，单次约 1-2ms）。
+            try {
+                Set<Long> authorIds = new HashSet<>();
+                for (PostModerationMsg msg : passMsgs) {
+                    if (Boolean.TRUE.equals(msg.getIsNew()) && msg.getUserId() != null && msg.getUserId() > 0) {
+                        authorIds.add(msg.getUserId());
                     }
                 }
-            } else {
-                if (action == ContentModerationUtil.Action.MANUAL_REVIEW) {
-                    post.setStatus(2);
-                    log.warn("帖子待人工审核 postId={} desc={}", post.getId(), result.getDescription());
-                } else {
-                    post.setStatus(3);
-                    log.warn("帖子审核拒绝 postId={} label={} desc={}", post.getId(),
-                            result.getLabel(), result.getDescription());
+                for (Long uid : authorIds) {
+                    userStatsRedisHelper.ensureUserStats(uid);
                 }
-                post.setModerationDesc(result.getDescription());
-                post.setModerationWords(result.getRiskWords());
-                postMapper.updateById(post);
+                if (!passMsgs.isEmpty()) {
+                    stringRedisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+                        for (PostModerationMsg msg : passMsgs) {
+                            if (!Boolean.TRUE.equals(msg.getIsNew()) || msg.getUserId() == null || msg.getUserId() <= 0) {
+                                continue;
+                            }
+                            byte[] statsKey = utf8(UserRedisKeys.stats(msg.getUserId()));
+                            connection.hashCommands().hIncrBy(statsKey, utf8("posts"), 1);
+                            connection.keyCommands().expire(statsKey, TimeUnit.DAYS.toSeconds(UserRedisKeys.USER_STATS_TTL));
+                            connection.setCommands().sAdd(utf8(UserRedisKeys.statsDirty(msg.getUserId())), utf8(msg.getUserId().toString()));
+                            if (msg.getTopicIds() != null && !msg.getTopicIds().isEmpty()) {
+                                for (String tid : msg.getTopicIds().split(",")) {
+                                    Long topicId = Long.valueOf(tid.trim());
+                                    byte[] topicKey = utf8(PostRedisKeys.topic(topicId));
+                                    connection.hashCommands().hIncrBy(topicKey, utf8("posts"), 1);
+                                    connection.keyCommands().expire(topicKey, TimeUnit.DAYS.toSeconds(PostRedisKeys.TOPIC_STATS_TTL));
+                                    connection.setCommands().sAdd(utf8(PostRedisKeys.topicDirty(topicId)), utf8(topicId.toString()));
+                                }
+                            }
+                        }
+                        return null;
+                    });
+                }
+            } catch (Exception e) {
+                log.error("帖子批量审核 Redis 统计更新失败（DB 已更新，统计待补偿）", e);
             }
-            log.info("帖子审核完成 postId={} action={}", post.getId(), action);
+
+            // 5) 拒绝通知（best-effort：失败只记日志，重投会因 status!=2 被跳过）
+            try {
+                for (NotificationEvent event : notifications) {
+                    rabbitTemplate.convertAndSend(RabbitMQConfig.NOTIFICATION_EXCHANGE,
+                            RabbitMQConfig.NOTIFICATION_KEY, event);
+                }
+            } catch (Exception e) {
+                log.error("帖子批量审核通知发送失败（已记录，不重投）", e);
+            }
+
+            log.info("帖子批量审核完成 batchSize={} pass={} reject={}",
+                    messages.size(), passPosts.size(), rejectPosts.size());
         } catch (Exception e) {
-            log.error("帖子审核失败 msg={}", msg, e);
+            log.error("帖子批量审核失败 batchSize={}", messages.size(), e);
             throw new RuntimeException("审核处理失败，触发MQ重试", e);
         }
     }
 
-    private void incrAuthorStats(Long userId) {
-        String key = UserRedisKeys.stats(userId);
-        stringRedisTemplate.opsForHash().increment(key, "posts", 1);
-        stringRedisTemplate.expire(key, UserRedisKeys.USER_STATS_TTL, TimeUnit.DAYS);
-        stringRedisTemplate.opsForSet().add(UserRedisKeys.statsDirty(), userId.toString());
+    private static byte[] utf8(String s) {
+        return s == null ? null : s.getBytes(StandardCharsets.UTF_8);
     }
 }

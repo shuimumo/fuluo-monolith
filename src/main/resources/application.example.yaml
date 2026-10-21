@@ -14,13 +14,19 @@ spring:
     username: guest
     password: guest
     virtual-host: /
+    # 发布端可靠性：correlated 确认 + mandatory 退回
+    publisher-confirm-type: correlated
+    publisher-returns: true
     listener:
       simple:
         prefetch: 10
         concurrency: 3
         max-concurrency: 5
+        # 重试耗尽的毒消息交给 DLX 死信，避免无限重投
+        default-requeue-rejected: false
     connection-timeout: 1000
     template:
+      mandatory: true
       retry:
         enabled: true
         max-attempts: 3
@@ -59,13 +65,21 @@ knife4j:
     language: zh_cn
 aliyun:
   oss:
+    # 显式开关：true 才创建 OSS Bean
+    enabled: false
     bucket-name:
     endpoint:
     access-key-id:
     access-key-secret:
   green:
+    # 显式开关：true 才创建内容审核 SDK Bean
+    enabled: false
     access-key-id:
     access-key-secret:
+fuluo:
+  moderation:
+    # 内容审核总开关：生产必须 true
+    enabled: true
 logging:
   level:
     com:
