@@ -34,3 +34,8 @@ MySQL 8、Redis、RabbitMQ、Elasticsearch 8.x、**Canal**（帖子/评论审核
 
 - 本仓库对应 cloud 的功能快照；两边的接口契约（`Result`、`PageVO`、`/notifications/**`、`/search`）一致，前端可共用。
 - 差异属结构性的：单体保留 Canal 扇出、无网关/独立通知服务/独立搜索服务、无服务间 Feign。
+
+## 提交规范
+
+提交信息遵循 `<type>(<scope>): <描述>`，仓库启用了 `.githooks/commit-msg` 校验（`core.hooksPath=.githooks`）。
+详见 [`docs/commit-convention.md`](docs/commit-convention.md)。
